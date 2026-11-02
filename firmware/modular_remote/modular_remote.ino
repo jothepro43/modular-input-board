@@ -322,6 +322,10 @@ void startBluetooth() {
   // Soliciting AMS is how an accessory asks an iPhone to connect and offer the service.
   BLEAdvertisementData advert;
   advert.setFlags(ESP_BLE_ADV_FLAG_GEN_DISC | ESP_BLE_ADV_FLAG_BREDR_NOT_SPT);
+  // iPhones list a new accessory in Bluetooth settings only for some device types, so this also
+  // advertises HID, as Espressif's AMS example does. The panel has no HID service.
+  advert.setAppearance(ESP_BLE_APPEARANCE_GENERIC_HID);
+  advert.setCompleteServices(BLEUUID((uint16_t)0x1812));
   char header[2] = {17, ESP_BLE_AD_TYPE_128SOL_SRV_UUID};
   advert.addData(std::string(header, 2) + std::string((const char*)AMS_SERVICE_LE, 16));
   BLEAdvertisementData scanResponse;

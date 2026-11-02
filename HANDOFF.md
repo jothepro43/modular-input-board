@@ -38,7 +38,17 @@ Spec: `firmware/display/DISPLAY_SPEC.md`. The items below override the spec wher
 - Hint text still says `PLAY:BACK`, because `car_stereo_ui.h` was left unchanged.
 - Mute has no AMS command, so it steps the volume to 0 and back up.
 
+## Connecting phones
+- The panel handles **one phone at a time** and stops advertising once one connects. A Mac scan could not
+  see it while a phone was connecting.
+- To switch iPhones, turn off Bluetooth on the connected one in Settings first, or it may reconnect first.
+- The panel now also advertises HID (`0x1812`) and the generic HID appearance, as Espressif's AMS example
+  does, so that an iPhone that has never paired can list it. It has no HID service.
+- **Unconfirmed:** whether the on-screen keyboard still appears with this HID label. Check Notes. If it
+  hides, undo this change. Also unconfirmed: that a second iPhone now lists and pairs with the panel.
+
 ## Next steps
+1. **Check the on-screen keyboard in Notes** with the HID label (see above).
 1. **Run the 7 checks the user has not reported on yet:**
    1. Volume shows, then music returns about 5 s after the last change. Is the scroll speed right now?
    2. 3 s hold opens the menu. 10 s idle closes it.
