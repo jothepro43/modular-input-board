@@ -19,6 +19,22 @@ See `HANDOFF.md`. It overrides this file where they differ:
   NeoKey GND → ATtiny GND. Switch: one pin → ATtiny input, other → GND. NeoPixel data-in → an
   ATtiny817 seesaw NeoPixel-capable pin (**pick it from the Adafruit guide**).
 
+## Key module wiring (bring-up test 2026-11-06)
+- Module = NeoKey socket (#4978) + ATtiny817 seesaw (#5233), I2C address 0x49.
+- Wiring: NeoKey + → ATtiny 3v, − → G, I (NeoPixel in) → seesaw pin 19, A (switch anode) → seesaw
+  pin 18, jumper C → − on the NeoKey top row. O unused.
+- Test sketch: `firmware/key_module_test`. It also checks all 8 mux ports, so it works with or without the PCA9548.
+- **Ran on the real board** (key behind mux port 1, knob on port 2, OLED on port 3):
+  - 0x49 found, product id 5233.
+  - **Pull-up wiring works through the diode:** pin 18 `INPUT_PULLUP`, pressed reads LOW. The fallback
+    (pull-down) is not needed.
+  - 48 presses in a row, each one exactly one PRESSED and one RELEASED, 20 ms debounce, no misses or doubles.
+- **Not confirmed:** the NeoPixel. The red/green/blue boot sequence and the white/dim-blue colors ran in
+  firmware, but nobody watched the LED yet, so GRB order and the pin 19 data wire are unchecked.
+  Send `L` over serial to replay the colors.
+- Only one key module is built. The second (Skip) key is not wired yet.
+- The test sketch does not drive the OLED, so the screen is blank while it runs.
+
 ## Toolchain on Joseph's PC
 - Arduino IDE 2.3.10 bundles arduino-cli, likely at
   `C:\Users\Joseph\AppData\Local\Programs\Arduino IDE\resources\app\lib\backend\resources\arduino-cli.exe`

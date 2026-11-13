@@ -14,11 +14,18 @@
       firmware/display/car_stereo_ui.h. See firmware/display/DISPLAY_SPEC.md.
       With no screen attached, the onboard NeoPixel shows pairing status instead
       (blinking blue = waiting to pair, green = connected).
-    - Key modules (ATtiny817) are detected and logged only. Play/Skip come later.
+    - Key modules (NeoKey socket + ATtiny817): up to two, Play/Pause and Skip (tap = next
+      track, hold 0.7 s = previous track). In the menu, Play goes back.
+      Each key remembers its own role in the ATtiny's EEPROM, so the role follows the key to
+      any port. A key with no role yet takes the free one (Play first) and keeps it.
+      Menu > SWAP KEYS, or "K" over serial, swaps the two roles.
+      To tell them apart: key LED is dim green = Play, dim blue = Skip (white while pressed),
+      and Menu > MODULES lists each port as PLAY or SKIP.
 
   Libraries: Adafruit seesaw, Adafruit SSD1306, Adafruit GFX, Adafruit NeoPixel.
   Use esp32 core 2.0.17. Send "C" over serial to forget all paired phones,
-  "S" to dump the screen buffer (see tools/oled_screenshot.py), "R" to re-read volume and track.
+  "S" to dump the screen buffer (see tools/oled_screenshot.py), "R" to re-read volume and track,
+  "K" to swap the Play and Skip keys.
   For testing the menu: "m" opens it, ">" "<" "P" act like a click up, click down and press
   but only while it is open, and "x" closes it. None of them can change the phone's volume.
 
@@ -32,6 +39,7 @@
 #include <BLEServer.h>
 #include <BLEClient.h>
 #include "Adafruit_seesaw.h"
+#include "seesaw_neopixel.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_NeoPixel.h>
@@ -49,11 +57,16 @@ const uint8_t OLED_ADDR_A = 0x3C;
 const uint8_t OLED_ADDR_B = 0x3D;  // the #326 on this board answers here
 const uint8_t KEY_ADDR    = 0x49;
 const uint8_t ENC_SWITCH  = 24;    // seesaw pin, per Adafruit's encoder_basic example
+const uint8_t KEY_SWITCH  = 18;    // seesaw pin on the ATtiny817, pressed reads LOW (firmware/key_module_test)
+const uint8_t KEY_PIXEL   = 19;    // seesaw pin for the NeoKey's NeoPixel
+const uint8_t KEY_ROLE_EEPROM = 0;    // byte in the key module's own EEPROM that holds its role
+const uint8_t KEY_ROLE_MARK   = 0xA0; // stored value is this mark plus the role (0 Play, 1 Skip)
 
 // ---------------- Tuning ----------------
 const uint8_t  PHONE_VOL_STEPS  = 16;    // iPhone volume steps from 0 to full
 const uint16_t DEBOUNCE_MS      = 25;
 const uint16_t MENU_HOLD_MS     = 3000;  // hold the knob this long to open the settings menu
+const uint16_t SKIP_HOLD_MS     = 700;   // hold Skip this long for previous track
 const uint16_t VOLUME_SHOW_MS   = 5000;  // how long the volume screen stays up after a change
 const uint8_t  SONG_SCROLL_MS   = 60;    // ms per pixel of scrolling
 const uint16_t SONG_PAUSE_MS    = 1500;  // rest at each end of a scroll
@@ -66,6 +79,12 @@ const uint16_t SCAN_EVERY_MS    = 2000;
 const uint8_t  POLL_MS          = 10;
 
 Adafruit_seesaw encoder(&Wire1);
+// seesaw_NeoPixel is also an Adafruit_seesaw, so one object per key reads the switch and drives the LED.
+const uint8_t KEY_PLAY = 0, KEY_SKIP = 1, KEY_COUNT = 2;
+seesaw_NeoPixel keyBoard[KEY_COUNT] = {
+  seesaw_NeoPixel(1, KEY_PIXEL, NEO_GRB + NEO_KHZ800, &Wire1),
+  seesaw_NeoPixel(1, KEY_PIXEL, NEO_GRB + NEO_KHZ800, &Wire1),
+};
 Adafruit_SSD1306 oled(128, 64, &Wire1, -1);
 Adafruit_NeoPixel statusPixel(1, PIN_NEOPIXEL, NEO_GRB + NEO_KHZ800);
 USBHIDConsumerControl usbMedia;
@@ -123,11 +142,15 @@ const char* AMS_ENTITY_UPDATE = "2F7CABCE-808D-411F-9A0C-BB92BA96C102";
 const char* AMS_ENTITY_ATTR   = "C6B2F38C-23AB-46D8-A6AB-A3A870BBD5D7";
 const uint8_t AMS_SERVICE_LE[16] = {0xDC, 0xF8, 0x55, 0xAD, 0x02, 0xC5, 0xF4, 0x8E,
                                     0x3A, 0x43, 0x36, 0x0F, 0x2B, 0x50, 0xD3, 0x89};
+const uint8_t CMD_PLAY_PAUSE = 2;
+const uint8_t CMD_NEXT_TRACK = 3;
+const uint8_t CMD_PREV_TRACK = 4;
 const uint8_t CMD_VOLUME_UP = 5;
 const uint8_t CMD_VOLUME_DOWN = 6;
 const uint8_t CMD_REREAD = 0xFF;  // not an AMS command: asks the task to read current values
 const uint8_t ENTITY_PLAYER = 0;
 const uint8_t ATTR_PLAYER_NAME = 0;
+const uint8_t ATTR_PLAYBACK = 1;   // "state,rate,elapsed"; state 1 = playing
 const uint8_t ATTR_VOLUME = 2;
 const uint8_t ENTITY_TRACK = 2;
 const uint8_t ATTR_ARTIST = 0;
@@ -143,6 +166,7 @@ volatile bool wasPaired = false;
 volatile bool restartPending = false;
 volatile int  phoneVolume = -1;   // 0..100, -1 = phone has no media player
 volatile bool volumeChanged = false;
+volatile int  playState = -1;     // 1 playing, 0 paused, -1 unknown
 volatile bool trackChanged = false;
 char trackTitle[64] = "";
 char trackArtist[64] = "";
@@ -220,6 +244,9 @@ void onEntityUpdate(BLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
     Serial.printf("Player: '%s'\n", value);
     uint8_t cmd = CMD_REREAD;  // the phone may not send track details when the app changes
     xQueueSend(amsQueue, &cmd, 0);
+  } else if (data[1] == ATTR_PLAYBACK) {
+    playState = n ? (value[0] == '1') : -1;
+    Serial.printf("Playback: '%s'\n", value);
   } else if (data[1] == ATTR_VOLUME) {
     phoneVolume = n ? (int)(atof(value) * 100 + 0.5) : -1;
     volumeChanged = true;
@@ -230,11 +257,13 @@ void onEntityUpdate(BLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
 void onRemoteCommands(BLERemoteCharacteristic*, uint8_t* data, size_t len, bool) {
   bool up = false;
   for (size_t i = 0; i < len; i++) up = up || data[i] == CMD_VOLUME_UP;
-  Serial.printf("Phone offers %u commands, volume up %s\n", (unsigned)len, up ? "available" : "NOT available");
+  Serial.printf("Phone offers %u commands, volume up %s:", (unsigned)len, up ? "available" : "NOT available");
+  for (size_t i = 0; i < len; i++) Serial.printf(" %u", data[i]);
+  Serial.println();
 }
 
 void subscribeVolume() {
-  uint8_t request[] = {ENTITY_PLAYER, ATTR_PLAYER_NAME, ATTR_VOLUME};
+  uint8_t request[] = {ENTITY_PLAYER, ATTR_PLAYER_NAME, ATTR_PLAYBACK, ATTR_VOLUME};
   entityUpdate->writeValue(request, sizeof(request), true);
   uint8_t trackRequest[] = {ENTITY_TRACK, ATTR_ARTIST, ATTR_TITLE};
   entityUpdate->writeValue(trackRequest, sizeof(trackRequest), true);
@@ -377,11 +406,14 @@ struct Button {
 };
 
 Button knobBtn(MENU_HOLD_MS);
+Adafruit_seesaw keyProbe(&Wire1);  // reads a key's stored role without resetting the module
+Button keyBtn[KEY_COUNT] = {Button(0), Button(SKIP_HOLD_MS)};  // Play has no hold action
 
 // ---------------- State ----------------
 int8_t   encChannel = -1;       // -1 = not found
 int8_t   oledChannel = -1;
-uint8_t  keyChannels = 0;       // bitmask, logged only for now
+uint8_t  keyChannels = 0;       // bitmask of mux channels with a key module
+int8_t   keyChannel[KEY_COUNT] = {-1, -1};  // per role, -1 = not found
 bool     muxOk = false;
 bool     wasConnected = false;
 bool     muted = false;
@@ -452,6 +484,91 @@ bool startOled(uint8_t ch, uint8_t addr) {
   return true;
 }
 
+void setKeyColor(uint8_t role, bool pressed) {
+  seesaw_NeoPixel &k = keyBoard[role];
+  uint32_t idle = role == KEY_PLAY ? k.Color(0, 20, 0) : k.Color(0, 0, 20);
+  k.setPixelColor(0, pressed ? k.Color(255, 255, 255) : idle);
+  k.show();
+}
+
+void loseKey(uint8_t role) {
+  Serial.printf("%s key lost from channel %d\n", role == KEY_PLAY ? "Play" : "Skip", keyChannel[role]);
+  keyChannel[role] = -1;
+  keyBtn[role].clear();
+}
+
+const char* keyName(uint8_t role) { return role == KEY_PLAY ? "PLAY" : "SKIP"; }
+
+// Returns the role stored on the key module on this channel, or -1 if it has none yet.
+int8_t readKeyRole(uint8_t ch) {
+  muxSelect(ch);
+  if (!keyProbe.begin(KEY_ADDR, -1, false)) return -1;
+  uint8_t value = keyProbe.EEPROMRead8(KEY_ROLE_EEPROM);
+  return (value & 0xFE) == KEY_ROLE_MARK ? (value & 1) : -1;
+}
+
+// Stores a role on the key module that currently has `role`'s object and channel.
+void writeKeyRole(uint8_t role, uint8_t newRole) {
+  muxSelect(keyChannel[role]);
+  keyBoard[role].EEPROMWrite8(KEY_ROLE_EEPROM, KEY_ROLE_MARK | newRole);
+  delay(20);  // EEPROM write time
+  bool ok = keyBoard[role].EEPROMRead8(KEY_ROLE_EEPROM) == (KEY_ROLE_MARK | newRole);
+  Serial.printf("Key on channel %d labelled %s: %s\n", keyChannel[role], keyName(newRole), ok ? "saved" : "SAVE FAILED");
+}
+
+bool startKey(uint8_t role, uint8_t ch) {
+  muxSelect(ch);
+  if (!keyBoard[role].begin(KEY_ADDR)) {
+    Serial.printf("Key on channel %u did not start\n", ch);
+    return false;
+  }
+  keyBoard[role].pinMode(KEY_SWITCH, INPUT_PULLUP);
+  keyBoard[role].setBrightness(255);
+  keyChannel[role] = ch;
+  setKeyColor(role, false);
+  // A key held while it is plugged in must not count as a press.
+  bool held = !keyBoard[role].digitalRead(KEY_SWITCH);
+  keyBtn[role].stable = keyBtn[role].lastRaw = keyBtn[role].holdFired = held;
+  Serial.printf("%s key on channel %u\n", keyName(role), ch);
+  return true;
+}
+
+// Each key carries its role. Keys that already have one are placed first; a key with no
+// role (or the same role as another key) then takes whichever role is still free.
+void assignKeys(uint8_t mask) {
+  for (uint8_t role = 0; role < KEY_COUNT; role++)
+    if (keyChannel[role] >= 0 && !(mask & (1 << keyChannel[role]))) loseKey(role);
+
+  for (uint8_t pass = 0; pass < 2; pass++) {
+    for (uint8_t ch = 0; ch < 8; ch++) {
+      if (!(mask & (1 << ch)) || ch == keyChannel[KEY_PLAY] || ch == keyChannel[KEY_SKIP]) continue;
+      if (keyChannel[KEY_PLAY] >= 0 && keyChannel[KEY_SKIP] >= 0) return;  // both roles filled
+      int8_t stored = readKeyRole(ch);
+      bool useStored = stored >= 0 && keyChannel[stored] < 0;
+      if (pass == 0 && !useStored) continue;
+      uint8_t role = useStored ? stored : (keyChannel[KEY_PLAY] < 0 ? KEY_PLAY : KEY_SKIP);
+      if (!startKey(role, ch)) continue;
+      if (stored < 0) writeKeyRole(role, role);
+      else if (stored != role) Serial.printf("Two keys are labelled %s; channel %u acts as %s for now\n", keyName(stored), ch, keyName(role));
+    }
+  }
+}
+
+// Swaps Play and Skip. With one key connected, it just changes that key's role.
+void swapKeys() {
+  if (keyChannel[KEY_PLAY] < 0 && keyChannel[KEY_SKIP] < 0) {
+    Serial.println("Swap keys: no key connected");
+    return;
+  }
+  for (uint8_t role = 0; role < KEY_COUNT; role++)
+    if (keyChannel[role] >= 0) writeKeyRole(role, role == KEY_PLAY ? KEY_SKIP : KEY_PLAY);
+  for (uint8_t role = 0; role < KEY_COUNT; role++) {
+    keyChannel[role] = -1;
+    keyBtn[role].clear();
+  }
+  assignKeys(keyChannels);  // picks the new labels back up
+}
+
 void scanModules() {
   muxOk = muxSelect(0);
   if (!muxOk) {
@@ -459,6 +576,7 @@ void scanModules() {
     Serial.println("Mux NOT found at 0x70");
     encChannel = oledChannel = -1;
     keyChannels = 0;
+    keyChannel[KEY_PLAY] = keyChannel[KEY_SKIP] = -1;
     return;
   }
 
@@ -483,8 +601,9 @@ void scanModules() {
   }
   if (keysNow != keyChannels) {
     keyChannels = keysNow;
-    Serial.printf("Key modules on channel mask 0x%02X (not used yet)\n", keyChannels);
+    Serial.printf("Key modules on channel mask 0x%02X\n", keyChannels);
   }
+  assignKeys(keysNow);  // also retries a key that failed to start
 }
 
 // ---------------- Link (Bluetooth or USB) ----------------
@@ -610,12 +729,13 @@ void updatePixel(bool connected, uint32_t now) {
 
 // ---------------- Settings menu ----------------
 enum ItemKind : uint8_t { ITEM_ACTION, ITEM_RANGE, ITEM_OPTION, ITEM_CHOOSE, ITEM_LIST, ITEM_INFO };
-enum ItemId : uint8_t { M_SYNC, M_BRIGHT, M_STEP, M_REVERSE, M_LINK, M_BLUETOOTH, M_MODULES,
+enum ItemId : uint8_t { M_SYNC, M_BRIGHT, M_STEP, M_REVERSE, M_LINK, M_BLUETOOTH, M_MODULES, M_KEYS,
                         M_SAVER, M_BOOT, M_GHOST, M_ABOUT, M_EXIT, MENU_COUNT };
 struct MenuItem { const char* label; ItemKind kind; };
 const MenuItem MENU[MENU_COUNT] = {
   {"SYNC VOL", ITEM_ACTION}, {"BRIGHT", ITEM_RANGE}, {"STEP", ITEM_RANGE}, {"REVERSE", ITEM_OPTION},
-  {"LINK", ITEM_OPTION}, {"BLUETOOTH", ITEM_CHOOSE}, {"MODULES", ITEM_LIST}, {"SAVER", ITEM_OPTION},
+  {"LINK", ITEM_OPTION}, {"BLUETOOTH", ITEM_CHOOSE}, {"MODULES", ITEM_LIST}, {"SWAP KEYS", ITEM_ACTION},
+  {"SAVER", ITEM_OPTION},
   {"BOOT ANIM", ITEM_OPTION}, {"GHOST", ITEM_OPTION}, {"ABOUT", ITEM_INFO}, {"EXIT", ITEM_ACTION},
 };
 const char* const LINK_NAMES[] = {"AUTO", "BT", "USB"};
@@ -639,13 +759,23 @@ void menuValueText(char* out, size_t size) {
       break;
     case M_MODULES:
       if (menuEditing) {
-        snprintf(out, size, "S%u %s", menuChoice + 1, MODULE_NAMES[moduleType[menuChoice]]);
+        const char* name = MODULE_NAMES[moduleType[menuChoice]];
+        for (uint8_t role = 0; role < KEY_COUNT; role++)
+          if (keyChannel[role] == menuChoice) name = keyName(role);
+        snprintf(out, size, "S%u %s", menuChoice + 1, name);
       } else {
         uint8_t found = 0;
         for (uint8_t ch = 0; ch < 8; ch++) found += moduleType[ch] != 0;
         snprintf(out, size, "%u FOUND", found);
       }
       break;
+    case M_KEYS: {
+      char play[4] = "--", skip[4] = "--";
+      if (keyChannel[KEY_PLAY] >= 0) snprintf(play, sizeof(play), "S%d", keyChannel[KEY_PLAY] + 1);
+      if (keyChannel[KEY_SKIP] >= 0) snprintf(skip, sizeof(skip), "S%d", keyChannel[KEY_SKIP] + 1);
+      snprintf(out, size, "PLAY %s SKIP %s", play, skip);
+      break;
+    }
     case M_SAVER:   strlcpy(out, SAVER_NAMES[settings.saver], size); break;
     case M_BOOT:    strlcpy(out, onOff(settings.bootAnim), size); break;
     case M_GHOST:   strlcpy(out, onOff(settings.ghost), size); break;
@@ -725,6 +855,8 @@ void menuPress(uint32_t now) {
     case ITEM_ACTION:
       if (menuIndex == M_EXIT) {
         closeMenu();
+      } else if (menuIndex == M_KEYS) {
+        swapKeys();
       } else {
         sendCommand(CMD_REREAD);
         showWord("SYNC", now);
@@ -780,7 +912,7 @@ void handleButton(uint8_t action, bool connected, uint32_t now) {
   if (action == 0) return;
   if (menuOpen) {
     if (action == 1) menuPress(now);
-    else closeMenu();           // no Play key yet, so holding the knob is the way back
+    else closeMenu();           // holding the knob also goes back, for panels with no Play key
     return;
   }
   if (action == 2) {
@@ -818,6 +950,59 @@ void pollEncoder(bool connected, uint32_t now) {
 
   handleTurn(delta, connected, now);
   handleButton(knobBtn.update(pressed, now), connected, now);
+}
+
+// ---------------- Keys ----------------
+void sendMedia(uint8_t amsCmd, uint16_t usbKey) {
+  if (usbActive()) pressUsbKey(usbKey);
+  else sendCommand(amsCmd);
+}
+
+void handleKey(uint8_t role, uint8_t action, bool connected, uint32_t now) {
+  if (action == 0) return;
+  if (menuOpen) {
+    // Play is the back key: leave the value being edited, or leave the menu.
+    if (role == KEY_PLAY) {
+      menuLastInput = now;
+      if (menuEditing) { menuEditing = false; screenDirty = true; }
+      else closeMenu();
+    }
+    return;
+  }
+  if (!connected) {
+    Serial.println("Key ignored: not connected");
+    return;
+  }
+  if (role == KEY_PLAY) {
+    bool wasPlaying = !usbActive() && playState == 1;
+    sendMedia(CMD_PLAY_PAUSE, CONSUMER_CONTROL_PLAY_PAUSE);
+    showWord(wasPlaying ? "PAUSE" : "PLAY", now);
+    Serial.println("Key: play/pause");
+  } else if (action == 1) {
+    sendMedia(CMD_NEXT_TRACK, CONSUMER_CONTROL_SCAN_NEXT);
+    showWord("SEEK>", now);
+    Serial.println("Key: next track");
+  } else {
+    sendMedia(CMD_PREV_TRACK, CONSUMER_CONTROL_SCAN_PREVIOUS);
+    showWord("<SEEK", now);
+    Serial.println("Key: previous track");
+  }
+}
+
+void pollKeys(bool connected, uint32_t now) {
+  for (uint8_t role = 0; role < KEY_COUNT; role++) {
+    if (keyChannel[role] < 0) continue;
+    muxSelect(keyChannel[role]);
+    if (!probe(KEY_ADDR)) { loseKey(role); continue; }
+    bool pressed = !keyBoard[role].digitalRead(KEY_SWITCH);
+    // A module pulled out mid-read returns junk, which could look like a press.
+    if (!probe(KEY_ADDR)) { loseKey(role); continue; }
+
+    bool before = keyBtn[role].stable;
+    uint8_t action = keyBtn[role].update(pressed, now);
+    if (keyBtn[role].stable != before) setKeyColor(role, keyBtn[role].stable);
+    handleKey(role, action, connected, now);
+  }
 }
 
 // Sends the screen buffer as hex, one line, for tools/oled_screenshot.py.
@@ -873,6 +1058,7 @@ void loop() {
     if (command == 'C') forgetAllPhones();
     if (command == 'S') dumpScreen();
     if (command == 'R') sendCommand(CMD_REREAD);
+    if (command == 'K') swapKeys();
     if (command == 'm' && !menuOpen) openMenu(now);
     if (command == 'x' && menuOpen) closeMenu();
     if (command == '>' && menuOpen) menuTurn(1, now);
@@ -908,11 +1094,12 @@ void loop() {
   if (now - lastScan >= SCAN_EVERY_MS) {
     lastScan = now;
     scanModules();
-    Serial.printf("[alive] mux=%s encoder=%d oled=%d keys=0x%02X linked=%d paired=%d ams=%d vol=%d%s\n", muxOk ? "ok" : "MISSING",
-                  encChannel, oledChannel, keyChannels, linked, paired, amsReady, phoneVolume, muted ? " muted" : "");
+    Serial.printf("[alive] mux=%s encoder=%d oled=%d play=%d skip=%d linked=%d paired=%d ams=%d vol=%d%s\n", muxOk ? "ok" : "MISSING",
+                  encChannel, oledChannel, keyChannel[KEY_PLAY], keyChannel[KEY_SKIP], linked, paired, amsReady, phoneVolume, muted ? " muted" : "");
   }
 
   pollEncoder(connected, now);
+  pollKeys(connected, now);
 
   if (screenDirty) { screenDirty = false; drawScreen(connected); }
   updatePixel(connected, now);

@@ -3,6 +3,21 @@
 Current firmware: `firmware/modular_remote/modular_remote.ino`, running on the board now.
 Spec: `firmware/display/DISPLAY_SPEC.md`. The items below override the spec where they differ.
 
+## Update 2026-11-13: Play and Skip keys added
+- `modular_remote` now uses up to two key modules (0x49, switch on seesaw pin 18, LED on pin 19).
+  Play/Pause and Skip (tap = next, hold 0.7 s = previous). In the menu, Play goes back.
+- **Each key stores its own role** in byte 0 of its ATtiny's EEPROM (0xA0 Play, 0xA1 Skip), so the role
+  follows the key to any port. A key with no role takes the free one (Play first) and keeps it.
+  Menu > SWAP KEYS or serial `K` swaps them. Menu > MODULES shows each port as PLAY or SKIP.
+  Key LED: dim green = Play, dim blue = Skip, white while pressed.
+  The key on port 7 was labelled Play and the save read back correctly. Swap is untested.
+- It also reads the phone's play state, so the screen shows `PAUSE` or `PLAY`, and logs the command
+  IDs each app offers.
+- Flashed and booted: mux, knob (port 0), OLED (port 3) and one key (port 7) found, iPhone reconnected.
+  **The second key did not answer on any port.** No key press, LED colour or screen word has been
+  checked on the board yet.
+- No esptool 5 venv was on this Mac. `tools/upload.sh` needs one made each time or kept somewhere.
+
 ## What ran on the real board
 - QT Py, PCA9548 and encoder: STEMMA QT port is `Wire1` (SDA1 41, SCL1 40). Mux 0x70, encoder 0x36.
 - **OLED answers at 0x3D, not 0x3C.** Firmware accepts both.
